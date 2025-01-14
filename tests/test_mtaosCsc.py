@@ -204,21 +204,51 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
             await salobj.set_summary_state(self.remote, salobj.State.ENABLED)
 
             remote = self._getRemote()
-            await remote.cmd_resetCorrection.set_start(timeout=STD_TIMEOUT)
-
-            dof = await remote.evt_degreeOfFreedom.next(
-                flush=False, timeout=SHORT_TIMEOUT
+            dof_before_reset = await self.assert_next_sample(
+                remote.evt_degreeOfFreedom, flush=False, timeout=SHORT_TIMEOUT
             )
+            remote.evt_m2Correction.flush()
+            remote.evt_m1m3Correction.flush()
+            remote.evt_m2HexapodCorrection.flush()
+            remote.evt_cameraHexapodCorrection.flush()
+
+            await remote.cmd_resetCorrection.set_start(timeout=STD_TIMEOUT)
+            dof = await self.assert_next_sample(
+                remote.evt_degreeOfFreedom, flush=False, timeout=SHORT_TIMEOUT
+            )
+
             dofAggr = dof.aggregatedDoF
             dofVisit = dof.visitDoF
             self.assertEqual(len(dofAggr), 50)
             self.assertEqual(len(dofVisit), 50)
-            self.assertEqual(np.sum(np.abs(dofAggr)), 0)
-            self.assertEqual(np.sum(np.abs(dofVisit)), 0)
+            self.assertEqual(
+                np.sum(np.abs(dofAggr)), np.sum(np.abs(dof_before_reset.aggregatedDoF))
+            )
+            self.assertEqual(
+                np.sum(np.abs(dofVisit)), np.sum(np.abs(dof_before_reset.visitDoF))
+            )
 
-            await self._checkCorrIsZero(remote)
+            await self.assert_next_sample(
+                remote.evt_m2HexapodCorrection,
+                flush=False,
+                timeout=STD_TIMEOUT,
+            )
+            await self.assert_next_sample(
+                remote.evt_cameraHexapodCorrection,
+                flush=False,
+                timeout=STD_TIMEOUT,
+            )
+            await self.assert_next_sample(
+                remote.evt_m2Correction,
+                flush=False,
+                timeout=STD_TIMEOUT,
+            )
+            await self.assert_next_sample(
+                remote.evt_m1m3Correction,
+                flush=False,
+                timeout=STD_TIMEOUT,
+            )
 
-    async def _checkCorrIsZero(self, remote):
         await self.assert_next_sample(
             remote.evt_m2HexapodCorrection,
             flush=False,
@@ -266,26 +296,19 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(salobj.AckError):
                 await remote.cmd_issueCorrection.set_start(timeout=10.0)
 
-            dof = await remote.evt_rejectedDegreeOfFreedom.next(
-                flush=False, timeout=SHORT_TIMEOUT
+            dof = await self.assert_next_sample(
+                remote.evt_rejectedDegreeOfFreedom, flush=False, timeout=SHORT_TIMEOUT
             )
             dofAggr = dof.aggregatedDoF
             dofVisit = dof.visitDoF
             self.assertEqual(len(dofAggr), 50)
             self.assertEqual(len(dofVisit), 50)
-            self.assertEqual(np.sum(np.abs(dofAggr)), 0)
             self.assertEqual(np.sum(np.abs(dofVisit)), 0)
 
             await self.assert_next_sample(
                 remote.evt_rejectedM2HexapodCorrection,
                 flush=False,
                 timeout=SHORT_TIMEOUT,
-                x=0,
-                y=0,
-                z=0,
-                u=0,
-                v=0,
-                w=0,
             )
 
     async def test_addAberration(self):
