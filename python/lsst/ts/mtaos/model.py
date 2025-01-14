@@ -427,8 +427,6 @@ class Model:
 
         self.ofc.controller.aggregate_state(-lv_dof, self.ofc.ofc_data.dof_idx)
 
-        self.ofc.lv_dof = self.ofc.controller.dof_state.copy()
-
         (
             self.m2_hexapod_correction,
             self.cam_hexapod_correction,
