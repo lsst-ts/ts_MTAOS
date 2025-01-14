@@ -180,9 +180,6 @@ class WavefrontCollection(object):
                 ]
             )
 
-        self._collectionDataTaken = dict()
-        self._numDataTaken = 0
-
         return wfe_avg
 
 

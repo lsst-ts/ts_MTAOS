@@ -27,7 +27,6 @@ import json
 import logging
 import time
 import typing
-import warnings
 
 import eups
 import numpy as np
@@ -177,8 +176,10 @@ class MTAOS(salobj.ConfigurableCsc):
                 index=utility.MTHexapodIndex.Camera.value,
                 include=[],
             ),
-            "m1m3": salobj.Remote(self.domain, "MTM1M3", include=[]),
-            "m2": salobj.Remote(self.domain, "MTM2", include=[]),
+            "m1m3": salobj.Remote(
+                self.domain, "MTM1M3", include=["appliedActiveOpticForces"]
+            ),
+            "m2": salobj.Remote(self.domain, "MTM2", include=["axialForce"]),
         }
 
         self.execution_times = {}
@@ -192,6 +193,14 @@ class MTAOS(salobj.ConfigurableCsc):
             "m1m3",
             "m2",
         }
+        # Minimum forces to apply for m1m3.
+        # If no force is larger than this value, in the
+        # figure, forces won't be applied.
+        self.m1m3_min_forces_to_apply = 1e-3
+        # Minimum forces to apply for m2.
+        # If no force is larger than this value, in the
+        # figure, forces won't be applied.
+        self.m2_min_forces_to_apply = 1e-3
 
         self.ocps = salobj.Remote(self.domain, "OCPS", 101)
 
@@ -505,23 +514,31 @@ class MTAOS(salobj.ConfigurableCsc):
             if extra_visit_id is None:
                 raise NotImplementedError("Use OCPS not implemented for LSSTCam.")
             else:
-                config = {
-                    "LSSTComCam-FROM-OCS_DONUTPAIR": f"{intra_visit_id},{extra_visit_id}"
-                }
+                try:
+                    self.log.debug("Check if visit was already processed.")
+                    await self.model.query_ocps_results(
+                        intra_visit_id,
+                        extra_visit_id,
+                        timeout=1,
+                    )
+                except asyncio.TimeoutError:
+                    self.log.debug("Pair not processed yet.")
 
-                start_time = time.time()
-                await self.ocps.cmd_execute.set_start(
-                    config=json.dumps(config),
-                    timeout=self.DEFAULT_TIMEOUT,
-                )
+                    config = {
+                        "LSSTComCam-FROM-OCS_DONUTPAIR": f"{intra_visit_id},{extra_visit_id}"
+                    }
 
-                if "RUN_WEP" not in self.execution_times:
-                    self.execution_times["RUN_WEP"] = []
-                self.execution_times["RUN_WEP"].append(time.time() - start_time)
+                    start_time = time.time()
+                    await self.ocps.cmd_execute.set_start(
+                        config=json.dumps(config),
+                        timeout=self.DEFAULT_TIMEOUT,
+                    )
 
-            self.model.query_ocps_results(
-                "LSSTComCam/quickLook", intra_visit_id, extra_visit_id
-            )
+                    if "RUN_WEP" not in self.execution_times:
+                        self.execution_times["RUN_WEP"] = []
+                    self.execution_times["RUN_WEP"].append(time.time() - start_time)
+
+                    await self.model.query_ocps_results(intra_visit_id, extra_visit_id)
         else:
             # timestamp command was sent in ISO 8601 compliant date-time format
             # (YYYY-MM-DDTHH:MM:SS.sss), removing invalid characters.
@@ -581,11 +598,9 @@ class MTAOS(salobj.ConfigurableCsc):
         )
 
         async with self.issue_correction_lock:
+            kp = self.model.ofc.controller.kp
             if data.userGain != 0.0:
-                warnings.warn(
-                    "Using userGain parameter is deprecated. Use the config yaml string instead.",
-                    DeprecationWarning,
-                )
+                self.model.ofc.controller.kp = data.userGain
 
             config = yaml.safe_load(data.config) if len(data.config) > 0 else dict()
 
@@ -593,13 +608,21 @@ class MTAOS(salobj.ConfigurableCsc):
             # This is needed to set what degrees of freedom will be used,
             # how many zernikes, etc.
             self.log.debug("Customizing OFC parameters.")
-            await self.model.set_ofc_data_values(**config)
+            original_ofc_data_values = await self.model.set_ofc_data_values(**config)
 
-            # If this call fails (raise an exeception), command will be
-            # rejected.
-            # This is not a coroutine so it will block the event loop. Need
-            # to think about how to fix it, maybe run in executor?
-            self.model.calculate_corrections(log_time=self.execution_times, **config)
+            try:
+                # If this call fails (raise an exeception), command will be
+                # rejected.
+                # This is not a coroutine so it will block the event loop. Need
+                # to think about how to fix it, maybe run in executor?
+                self.model.calculate_corrections(
+                    log_time=self.execution_times, **config
+                )
+                self.model.wavefront_errors.clear()
+            finally:
+                self.log.info("Restore ofc data values.")
+                await self.model.set_ofc_data_values(**original_ofc_data_values)
+                self.model.ofc.controller.kp = kp
 
             while (
                 len(self.execution_times["CALCULATE_CORRECTIONS"])
@@ -1000,11 +1023,31 @@ class MTAOS(salobj.ConfigurableCsc):
             z_forces = np.negative(z_forces)
 
         try:
-            await self.remotes["m1m3"].cmd_applyActiveOpticForces.set_start(
-                timeout=self.DEFAULT_TIMEOUT, zForces=z_forces
-            )
-
-            self.log.debug("Issue the M1M3 correction successfully.")
+            should_apply = True
+            try:
+                applied_active_optics_forces = await self.remotes[
+                    "m1m3"
+                ].evt_appliedActiveOpticForces.aget(timeout=self.DEFAULT_TIMEOUT)
+                delta_z_forces = z_forces - applied_active_optics_forces.zForces
+                should_apply = np.any(
+                    np.abs(delta_z_forces) > self.m1m3_min_forces_to_apply
+                )
+            except asyncio.TimeoutError:
+                self.log.warning(
+                    "Could not determine currently applied AOS forces for M1M3. "
+                    "Applying full figure."
+                )
+                should_apply = True
+            if should_apply:
+                await self.remotes["m1m3"].cmd_applyActiveOpticForces.set_start(
+                    timeout=self.DEFAULT_TIMEOUT, zForces=z_forces
+                )
+                self.log.debug("Issue the M1M3 correction successfully.")
+            else:
+                self.log.info(
+                    "Skipping applying m1m3 forces. "
+                    f"No values above threshold of {self.m1m3_min_forces_to_apply}N."
+                )
 
         except Exception:
             self.log.exception("M1M3 correction command failed.")
@@ -1027,6 +1070,21 @@ class MTAOS(salobj.ConfigurableCsc):
             z_forces = np.negative(z_forces)
 
         try:
+            try:
+                axial_forces = await self.remotes["m2"].tel_axialForce.aget(
+                    timeout=self.DEFAULT_TIMEOUT
+                )
+                delta_forces = z_forces - axial_forces.applied
+                if np.all(np.abs(delta_forces) < self.m2_min_forces_to_apply):
+                    self.log.info(
+                        f"Delta forces for M2 all below threshold ({self.m2_min_forces_to_apply}N). Skipping."
+                    )
+                    return
+            except asyncio.TimeoutError:
+                self.log.info(
+                    "Could not determine the current M2 axial forces. Applying full figure."
+                )
+
             await self.remotes["m2"].cmd_applyForces.set_start(
                 timeout=self.DEFAULT_TIMEOUT, axial=z_forces
             )

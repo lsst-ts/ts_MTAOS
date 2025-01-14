@@ -24,6 +24,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 from lsst.ts import mtaos, salobj
 
@@ -191,22 +192,23 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
                 flush=False, timeout=SHORT_TIMEOUT
             )
 
-            # DoF after issueCorrection is rejected should be similar to DoF
-            # before applying addAberration.
+            # Aggregated DoF after issueCorrection is rejected should be
+            # similar to aggregated DoF before applying addAberration.
             self.assertTrue(
                 np.allclose(
                     dof_add_aberration_before.aggregatedDoF,
                     dof_issue_correction_after.aggregatedDoF,
                 ),
-                f"Expected {dof_add_aberration_before.aggregatedDoF} vs "
+                f"Error with aggregated DoF. Expected {dof_add_aberration_before.aggregatedDoF} vs "
                 f"Received {dof_issue_correction_after.aggregatedDoF}.",
             )
+            # Visit DoF shoud remain the same though.
             self.assertTrue(
                 np.allclose(
-                    dof_add_aberration_before.visitDoF,
+                    dof_add_aberration_after.visitDoF,
                     dof_issue_correction_after.visitDoF,
                 ),
-                f"Expected {dof_add_aberration_before.visitDoF} vs "
+                f"Error with visitDoF. Expected {dof_add_aberration_after.visitDoF} vs "
                 f"Received {dof_issue_correction_after.visitDoF}.",
             )
 
@@ -326,10 +328,18 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
                 flush=False, timeout=STD_TIMEOUT
             )
 
-            assert dof_second.aggregatedDoF[0] - dof_first.aggregatedDoF[0] == 0.1
-            assert dof_second.aggregatedDoF[5] - dof_first.aggregatedDoF[5] == 0.1
-            assert dof_second.aggregatedDoF[10] - dof_first.aggregatedDoF[10] == 0.1
-            assert dof_second.aggregatedDoF[30] - dof_first.aggregatedDoF[30] == 0.1
+            assert dof_second.aggregatedDoF[0] - dof_first.aggregatedDoF[
+                0
+            ] == pytest.approx(0.1)
+            assert dof_second.aggregatedDoF[5] - dof_first.aggregatedDoF[
+                5
+            ] == pytest.approx(0.1)
+            assert dof_second.aggregatedDoF[10] - dof_first.aggregatedDoF[
+                10
+            ] == pytest.approx(0.1)
+            assert dof_second.aggregatedDoF[30] - dof_first.aggregatedDoF[
+                30
+            ] == pytest.approx(0.1)
 
             assert len(self.m2_hex_corrections) == 1
             assert len(self.cam_hex_corrections) == 1
@@ -477,24 +487,34 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
 
         self.cscM2Hex.cmd_move.callback = self.hexapod_move_callbck
         self.cscCamHex.cmd_move.callback = self.hexapod_move_callbck
+        self.cscM1M3.cmd_clearActiveOpticForces.callback = (
+            self.m1m3_clear_active_optic_forces_callback
+        )
         self.cscM1M3.cmd_applyActiveOpticForces.callback = (
             self.m1m3_apply_forces_callbck
         )
         self.cscM2.cmd_applyForces.callback = self.m2_apply_forces_callbck
+        self.cscM2.cmd_resetForceOffsets.callback = self.m2_reset_force_offsets_callback
 
-    def hexapod_move_callbck(self, data):
+    async def hexapod_move_callbck(self, data):
         if data.salIndex == mtaos.utility.MTHexapodIndex.M2.value:
             self.m2_hex_corrections.append(data)
         else:
             self.cam_hex_corrections.append(data)
 
-    def m1m3_apply_forces_callbck(self, data):
+    async def m1m3_clear_active_optic_forces_callback(self, data):
+        await asyncio.sleep(1.0)
+
+    async def m1m3_apply_forces_callbck(self, data):
         self.m1m3_corrections.append(data)
 
-    def m1m3_apply_forces_fail_callbck(self, data):
+    async def m1m3_apply_forces_fail_callbck(self, data):
         raise RuntimeError("This is a test.")
 
-    def m2_apply_forces_callbck(self, data):
+    async def m2_reset_force_offsets_callback(self, data):
+        await asyncio.sleep(1.0)
+
+    async def m2_apply_forces_callbck(self, data):
         self.m2_corrections.append(data)
 
     async def _startCsc(self):
