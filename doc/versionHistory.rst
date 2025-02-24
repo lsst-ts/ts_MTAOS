@@ -2,6 +2,10 @@
 Version History
 ===============
 
+v0.17.0
+-------
+
+* Added new closed loop task commands `do_startClosedLoop` and `do_stopClosedLoop` in `mtaos.py``.
 v0.16.1
 -------
 

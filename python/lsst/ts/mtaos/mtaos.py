@@ -33,9 +33,11 @@ import numpy as np
 import yaml
 from astropy import units as u
 from lsst.ts import salobj
-from lsst.ts.idl.enums.MTAOS import FilterType
+from lsst.ts.idl.enums.MTAOS import ClosedLoopState, FilterType
+from lsst.ts.observatory.control.maintel.comcam import ComCam
+from lsst.ts.observatory.control.maintel.lsstcam import LsstCam
 from lsst.ts.ofc import OFCData
-from lsst.ts.utils import astropy_time_from_tai_unix
+from lsst.ts.utils import astropy_time_from_tai_unix, make_done_future
 
 from . import CONFIG_SCHEMA, TELESCOPE_DOF_SCHEMA, Config, Model, __version__, utility
 
@@ -59,6 +61,7 @@ class MTAOS(salobj.ConfigurableCsc):
     LONG_TIMEOUT = 60.0
     LOG_FILE_NAME = "MTAOS.log"
     MAX_TIME_SAMPLE = 100
+    CMD_TIMEOUT = 60.0
 
     def __init__(
         self, config_dir=None, log_to_file=False, log_level=None, simulation_mode=0
@@ -111,6 +114,25 @@ class MTAOS(salobj.ConfigurableCsc):
             when the user does not provide an override configuration.
         execution_times : `dict`
             Dictionary to store critical execution times.
+        ocps: `salobj.Remote`
+            Remote for the OCPS component.
+        mtcs: `lsst.ts.mtaos.MTCS`
+            MTCS CSC.
+        camera: `lsst.ts.observatory.control.maintel.lsstcam.LsstCam` or
+            `lsst.ts.observatory.control.maintel.comcam.ComCam`
+            Camera object.
+        stress_scale_approach: `str`
+            Approach to scale or truncate the bending modes to keep the total
+            stress within limits.
+        stress_scale_factor: `float`
+            Factor to scale the bending modes to keep the total stress within
+            limits.
+        m1m3_stress_limit: `float`
+            Maximum allowable stress on the M1M3 mirror.
+        m2_stress_limit: `float`
+            Maximum allowable stress on the M2 mirror.
+        use_ocps: `bool`
+            Flag to use OCPS for the WEP process.
         DEFAULT_TIMEOUT : `float`
             Default timeout (in seconds). Used on normal operations, e.g.
             issuing corrections to the CSCs.
@@ -203,6 +225,10 @@ class MTAOS(salobj.ConfigurableCsc):
         self.m2_min_forces_to_apply = 1e-3
 
         self.ocps = salobj.Remote(self.domain, "OCPS", 101)
+        self.mtcs = salobj.Remote(self.domain, "MTCS", 101)
+
+        self._camera = None
+        self.closed_loop_task = make_done_future()
 
         # Model class to do the real data processing
         self.model = None
@@ -304,6 +330,22 @@ class MTAOS(salobj.ConfigurableCsc):
                     )
         else:
             self.wep_config = dict()
+
+        if config.camera == "comcam":
+            self.camera = ComCam(
+                self.domain,
+                log=self.log,
+                tcs_ready_to_take_data=self.mtcs.ready_to_take_data,
+            )
+        elif config.camera == "lsstCam":
+            self.camera = LsstCam(
+                self.domain,
+                log=self.log,
+                tcs_ready_to_take_data=self.mtcs.ready_to_take_data,
+            )
+        self.oods = self.camera.rem.ccoods
+        self.use_ocps = config.use_ocps
+        self.used_dofs = config.used_dofs
 
         # Set the stress scale approach, factor, and limits
         self.stress_scale_approach = config.stress_scale_approach
@@ -511,34 +553,37 @@ class MTAOS(salobj.ConfigurableCsc):
         )
 
         if data.useOCPS:
-            if extra_visit_id is None:
-                raise NotImplementedError("Use OCPS not implemented for LSSTCam.")
-            else:
-                try:
-                    self.log.debug("Check if visit was already processed.")
-                    await self.model.query_ocps_results(
-                        intra_visit_id,
-                        extra_visit_id,
-                        timeout=1,
-                    )
-                except asyncio.TimeoutError:
-                    self.log.debug("Pair not processed yet.")
+            try:
+                self.log.debug("Check if visit was already processed.")
+                await self.model.query_ocps_results(
+                    self.model.instrument,
+                    intra_visit_id,
+                    extra_visit_id,
+                    timeout=1,
+                )
+            except asyncio.TimeoutError:
+                self.log.debug("Image not processed yet.")
 
+                if extra_visit_id is None:
+                    config = {"LSSTCam-FROM-OCS_CWFSIMAGE": f"{intra_visit_id}"}
+                else:
                     config = {
                         "LSSTComCam-FROM-OCS_DONUTPAIR": f"{intra_visit_id},{extra_visit_id}"
                     }
 
-                    start_time = time.time()
-                    await self.ocps.cmd_execute.set_start(
-                        config=json.dumps(config),
-                        timeout=self.DEFAULT_TIMEOUT,
-                    )
+                start_time = time.time()
+                await self.ocps.cmd_execute.set_start(
+                    config=json.dumps(config),
+                    timeout=self.DEFAULT_TIMEOUT,
+                )
 
-                    if "RUN_WEP" not in self.execution_times:
-                        self.execution_times["RUN_WEP"] = []
-                    self.execution_times["RUN_WEP"].append(time.time() - start_time)
+                if "RUN_WEP" not in self.execution_times:
+                    self.execution_times["RUN_WEP"] = []
+                self.execution_times["RUN_WEP"].append(time.time() - start_time)
 
-                    await self.model.query_ocps_results(intra_visit_id, extra_visit_id)
+                await self.model.query_ocps_results(
+                    self.model.instrument, intra_visit_id, extra_visit_id
+                )
         else:
             # timestamp command was sent in ISO 8601 compliant date-time format
             # (YYYY-MM-DDTHH:MM:SS.sss), removing invalid characters.
@@ -761,6 +806,87 @@ class MTAOS(salobj.ConfigurableCsc):
             await self.handle_corrections()
             await self.pubEvent_degreeOfFreedom()
             await self.pubEvent_mirrorStresses()
+
+    def do_stopClosedLoop(self):
+        """Stop the closed loop operation."""
+        self._logExecFunc()
+
+        self.closed_loop_task.cancel()
+        await self.evt_closedLoopState.set_write(state=ClosedLoopState.IDLE)
+
+    def do_startClosedLoop(self):
+        """Start the closed loop operation."""
+        self.closed_loop_task = asyncio.create_task(self.closed_loop())
+
+    async def closed_loop(self):
+        """Closed loop operation."""
+        self._logExecFunc()
+
+        prev_elevation = None
+        while self.summary_state == salobj.State.ENABLED:
+            try:
+                await self.evt_closedLoopState.set_write(
+                    state=ClosedLoopState.WAITING_IMAGE
+                )
+
+                self.oods.evt_imageInOODS.flush()
+                image_in_oods = await self.oods.evt_imageInOODS.next(
+                    flush=False, timeout=self.exposure_time
+                )
+                self.log.info(
+                    f"Image {image_in_oods.obsid} {image_in_oods.raft} {image_in_oods.sensor} ingested."
+                )
+
+                await self.evt_closedLoopState.set_write(
+                    state=ClosedLoopState.PROCESSING
+                )
+
+                await self.do_runWEP.set_start(
+                    visitId=image_in_oods.obsid,
+                    extraId=None,
+                    useOCPS=self.use_ocps,
+                    config=self.wep_config,
+                    timeout=self.CMD_TIMEOUT,
+                )
+
+                filter, rotation_angle, elevation = await self.model.get_image_info(
+                    image_in_oods.obsid
+                )
+
+                if prev_elevation is not None and abs(elevation - prev_elevation) > 9:
+                    self.log.warning(
+                        "Elevation delta is greater than 9 deg. Not applying corrections."
+                    )
+                    prev_elevation = elevation
+                    continue
+
+                config = {
+                    "filter_name": filter,
+                    "rotation_angle": rotation_angle,
+                    "comp_dof_idx": {
+                        "m2HexPos": [float(val) for val in self.used_dofs[:5]],
+                        "camHexPos": [float(val) for val in self.used_dofs[5:10]],
+                        "M1M3Bend": [float(val) for val in self.used_dofs[10:30]],
+                        "M2Bend": [float(val) for val in self.used_dofs[30:]],
+                    },
+                }
+                config_yaml = yaml.safe_dump(config)
+
+                await self.do_runOFC.set_start(
+                    userGain=0.0,
+                    config=config_yaml,
+                    timeout=self.CMD_TIMEOUT,
+                )
+
+                await self.evt_closedLoopState.set_write(
+                    state=ClosedLoopState.WAITING_APPLY
+                )
+                await self.do_issueCorrection.set_start(timeout=self.CMD_TIMEOUT)
+
+            except Exception:
+                self.log.exception("Closed loop failed; turning off closed loop mode")
+                await self.evt_closedLoopState.set_write(state=ClosedLoopState.ERROR)
+                return
 
     def apply_stress_correction(
         self,

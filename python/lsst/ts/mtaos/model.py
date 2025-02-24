@@ -682,19 +682,16 @@ class Model:
             )
         )
 
-    async def query_ocps_results(self, intra_id, extra_id, timeout=300):
+    async def query_ocps_results(self, instrument, intra_id, extra_id, timeout=300):
         """Query the OCPS results."""
-        if extra_id is None:
-            raise NotImplementedError("OCPS is not implemented for Main Camera.")
-        else:
-            self.wavefront_errors.append(
-                await self._poll_butler_outputs(
-                    intra_id=intra_id,
-                    extra_id=extra_id,
-                    instrument="comcam",
-                    timeout=timeout,
-                )
+        self.wavefront_errors.append(
+            await self._poll_butler_outputs(
+                intra_id=intra_id,
+                extra_id=extra_id,
+                instrument=instrument,
+                timeout=timeout,
             )
+        )
 
     @contextlib.asynccontextmanager
     async def handle_wep_process(
@@ -1021,6 +1018,45 @@ class Model:
 
         return run_pipetask_cmd
 
+    async def get_image_info(self, visit_id):
+        """Get image information from the butler.
+
+        Parameters
+        ----------
+        visit_id : `int`
+            Visit id of the image.
+
+        Returns
+        -------
+        filter : `str`
+            Filter of the image.
+        rotation_angle : `float`
+            Rotation angle of the image.
+        elevation : `float`
+            Elevation of the image.
+
+        Raises
+        ------
+        ValueError
+            If the visit id is not found in the butler.
+        """
+        butler = dafButler.Butler(self.data_path)
+        refs = butler.query_datasets("raw", where=f"visit={visit_id}")
+
+        if len(refs) == 0:
+            raise ValueError(
+                f"Visit {visit_id} has no associated images in the butler."
+            )
+
+        image = butler.get(refs[0])
+        filter = image.getFilter().bandLabel
+        rotation_angle = image.getMetadata().get("ROTPA")
+        elevation = (
+            image.getMetadata().get("ELSTART") + image.getMetadata().get("ELEND")
+        ) / 2
+
+        return filter, rotation_angle, elevation
+
     async def _poll_butler_outputs(
         self,
         intra_id: int,
@@ -1063,23 +1099,24 @@ class Model:
         elapsed_time = 0.0
         n_tables = 9
 
+        pair_id = extra_id if extra_id is not None else intra_id
         while elapsed_time < timeout:
             try:
                 self.log.info(
                     f"Querying datasets: zernike_table_name={self.zernike_table_name}, "
-                    f"{self.run_name=} {extra_id=}."
+                    f"{self.run_name=} {pair_id=}."
                 )
-                data_ids = butler.registry.queryDatasets(
+                refs = butler.query_datasets(
                     self.zernike_table_name,
                     collections=[self.run_name],
-                    where=f"visit in ({extra_id})",
+                    where=f"visit in ({pair_id})",
                 )
-                if data_ids.count() >= n_tables:
-                    self.log.debug(f"Query returned {data_ids.count()} results.")
+                if refs.count() >= n_tables:
+                    self.log.debug(f"Query returned {refs.count()} results.")
                     break
                 else:
                     self.log.debug(
-                        f"Query returned {data_ids.count()} entries, waiting for {n_tables}. Continuing."
+                        f"Query returned {refs.count()} entries, waiting for {n_tables}. Continuing."
                     )
             except Exception:
                 self.log.exception(
@@ -1093,23 +1130,23 @@ class Model:
             self.log.error(f"Polling loop timed out {timeout=}s, {elapsed_time=}s.")
             raise TimeoutError(
                 f"Timeout: Could not find outputs for run '{self.run_name}' "
-                f"and visit id {extra_id} within {timeout} seconds."
+                f"and visit id {pair_id} within {timeout} seconds."
             )
 
         self.log.debug(
-            f"run_name: {self.run_name}, visit_id: {extra_id} yielded: {data_ids}"
+            f"run_name: {self.run_name}, visit_id: {pair_id} yielded: {refs}"
         )
 
         return [
             (
-                data_id.dataId["detector"],
+                ref.dataId["detector"],
                 butler.get(
                     self.zernike_table_name,
-                    dataId=data_id.dataId,
+                    dataId=ref.dataId,
                     collections=[self.run_name],
                 ),
             )
-            for data_id in data_ids
+            for ref in refs
         ]
 
     def _gather_outputs(
@@ -1150,25 +1187,23 @@ class Model:
             self.log.debug(ref.dataId)
 
         # Get output
-        data_ids = butler.registry.queryDatasets(
+        refs = butler.query_datasets(
             self.zernike_table_name,
             collections=[run_name],
         )
 
-        self.log.debug(
-            f"run_name: {run_name}, visit_id: {visit_id} yielded: {data_ids}"
-        )
+        self.log.debug(f"run_name: {run_name}, visit_id: {visit_id} yielded: {refs}")
 
         return [
             (
-                data_id.dataId["detector"],
+                ref.dataId["detector"],
                 butler.get(
                     self.zernike_table_name,
-                    dataId=data_id.dataId,
+                    dataId=ref.dataId,
                     collections=[run_name],
                 ),
             )
-            for data_id in data_ids
+            for ref in refs
         ]
 
     def reject_unreasonable_wfe(self, listOfWfErr):
