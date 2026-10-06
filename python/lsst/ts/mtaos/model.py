@@ -326,6 +326,9 @@ class Model:
         self.ofc_data = ofc_data
         self.ofc = OFC(ofc_data, log=self.log)
 
+        # PID diagnostics from the last correction calculation
+        self.reset_pid_diagnostics()
+
         # M2 hexapod correction
         self.m2_hexapod_correction = Correction()
 
@@ -663,6 +666,64 @@ class Model:
         """
         return self.ofc.controller.kp, self.ofc.controller.ki, self.ofc.controller.kd
 
+    def get_pid_diagnostics(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Get the PID diagnostics from the last correction calculation.
+
+        The values are in the basis the controller works in, the DOF basis or
+        the v-mode basis, and are mapped to the slots of the used DOFs. They
+        are all zero if the last correction was not calculated by the
+        controller.
+
+        Returns
+        -------
+        optical_state : `np.ndarray`
+            Estimated optical state.
+        integral_error : `np.ndarray`
+            Integral term before clipping.
+        integral_error_clipped : `np.ndarray`
+            Integral term after clipping.
+        derivative_term : `np.ndarray`
+            Derivative term before filtering.
+        derivative_term_filtered : `np.ndarray`
+            Derivative term after filtering.
+        """
+        return self._pid_diagnostics
+
+    def reset_pid_diagnostics(self) -> None:
+        """Set all PID diagnostics to zero."""
+        n_dofs = len(self.ofc.controller.dof_state0)
+        self._pid_diagnostics = (
+            np.zeros(n_dofs),
+            np.zeros(n_dofs),
+            np.zeros(n_dofs),
+            np.zeros(n_dofs),
+            np.zeros(n_dofs),
+        )
+
+    def _update_pid_diagnostics(self) -> None:
+        """Update the PID diagnostics with the values of the last controller
+        step.
+        """
+        controller = self.ofc.controller
+        dof_idx = self.ofc.ofc_data.dof_idx
+
+        self.reset_pid_diagnostics()
+        (
+            optical_state,
+            integral_error,
+            integral_error_clipped,
+            derivative_term,
+            derivative_term_filtered,
+        ) = self._pid_diagnostics
+
+        optical_state[dof_idx] = self.ofc.optical_state
+        integral_error[dof_idx] = controller.integral_unclipped
+        integral_error_clipped[dof_idx] = controller.integral
+        derivative_term[dof_idx] = controller.derivative
+        derivative_term_filtered[dof_idx] = controller.filtered_derivative
+
     def get_m1m3_bending_mode_stresses(self) -> np.ndarray:
         """Get the total M1M3 mirror stresses per bending mode.
 
@@ -718,6 +779,7 @@ class Model:
         """
 
         self._clear_wfe_collections()
+        self.reset_pid_diagnostics()
         (
             self.m2_hexapod_correction,
             self.cam_hexapod_correction,
@@ -738,6 +800,7 @@ class Model:
         # Update last visit DOF which is the last
         # applied dof not the aggregated one.
         self.ofc.lv_dof = offset
+        self.reset_pid_diagnostics()
 
         (
             self.m2_hexapod_correction,
@@ -1836,6 +1899,7 @@ class Model:
             subtract_intrinsics=self.subtract_intrinsics,
             control_vmodes=self.control_vmodes,
         )
+        self._update_pid_diagnostics()
 
         self.log.debug(
             f"{self.m2_hexapod_correction=}, "
