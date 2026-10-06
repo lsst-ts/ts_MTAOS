@@ -1,0 +1,1 @@
+In ``mtaos.py``, published the PID diagnostics (``opticalState``, ``integralError``, ``integralErrorClipped``, ``derivativeTerm`` and ``derivativeTermFiltered``) in the ``degreeOfFreedom`` and ``rejectedDegreeOfFreedom`` events.
