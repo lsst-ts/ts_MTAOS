@@ -443,6 +443,51 @@ class CscTestCase(salobj.BaseCscTestCase, unittest.IsolatedAsyncioTestCase):
             await self.assert_next_sample(remote.evt_m2Correction, flush=False, timeout=SHORT_TIMEOUT)
 
     @patch("lsst.ts.mtaos.model.Butler")
+    async def test_degree_of_freedom_pid_diagnostics(self, MockButler: Mock) -> None:
+        async with self.make_csc(initial_state=salobj.State.STANDBY, config_dir=None, simulation_mode=0):
+            await salobj.set_summary_state(self.remote, salobj.State.ENABLED)
+
+            remote = self._getRemote()
+            remote.evt_degreeOfFreedom.flush()
+            remote.evt_rejectedDegreeOfFreedom.flush()
+
+            wavefront_errors = np.zeros(19)
+            wavefront_errors[0] = 0.1
+            config = dict(name="lsstfam", filter_name="G", sensor_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8])
+            await remote.cmd_addAberration.set_start(
+                wf=wavefront_errors, config=yaml.safe_dump(config), timeout=STD_TIMEOUT
+            )
+
+            dof = await self.assert_next_sample(
+                remote.evt_degreeOfFreedom, flush=False, timeout=SHORT_TIMEOUT
+            )
+            pid_diagnostics = dict(
+                zip(
+                    (
+                        "opticalState",
+                        "integralError",
+                        "integralErrorClipped",
+                        "derivativeTerm",
+                        "derivativeTermFiltered",
+                    ),
+                    self.csc.model.get_pid_diagnostics(),
+                )
+            )
+            self.assertTrue(np.any(np.asarray(dof.opticalState) != 0))
+            for name, value in pid_diagnostics.items():
+                with self.subTest(event="degreeOfFreedom", field=name):
+                    np.testing.assert_array_almost_equal(getattr(dof, name), value)
+
+            await remote.cmd_rejectCorrection.start(timeout=STD_TIMEOUT)
+
+            rejected_dof = await self.assert_next_sample(
+                remote.evt_rejectedDegreeOfFreedom, flush=False, timeout=SHORT_TIMEOUT
+            )
+            for name, value in pid_diagnostics.items():
+                with self.subTest(event="rejectedDegreeOfFreedom", field=name):
+                    np.testing.assert_array_almost_equal(getattr(rejected_dof, name), value)
+
+    @patch("lsst.ts.mtaos.model.Butler")
     async def test_addAberration_with_config(self, MockButler: Mock) -> None:
         async with self.make_csc(initial_state=salobj.State.STANDBY, config_dir=None, simulation_mode=0):
             await salobj.set_summary_state(self.remote, salobj.State.ENABLED)

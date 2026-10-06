@@ -1,0 +1,2 @@
+In ``model.py``, added ``Model.get_pid_diagnostics`` and ``Model.reset_pid_diagnostics`` to keep the PID diagnostics of the last correction calculation, mapped to the 50 degrees of freedom.
+The diagnostics are cleared when the correction is not calculated by the controller.
