@@ -2104,10 +2104,22 @@ class MTAOS(salobj.ConfigurableCsc):
         dof_visit = model.get_dof_lv()
         visit_id, extra_id = model.get_visit_ids()
         kp_gain, ki_gain, kd_gain = model.get_gains()
+        (
+            optical_state,
+            integral_error,
+            integral_error_clipped,
+            derivative_term,
+            derivative_term_filtered,
+        ) = model.get_pid_diagnostics()
         focus_index = 0
         await self.evt_degreeOfFreedom.set_write(
             aggregatedDoF=dof_aggr,
             visitDoF=dof_visit,
+            opticalState=optical_state,
+            integralError=integral_error,
+            integralErrorClipped=integral_error_clipped,
+            derivativeTerm=derivative_term,
+            derivativeTermFiltered=derivative_term_filtered,
             visitId=visit_id,
             extraId=extra_id,
             kpGain=kp_gain
@@ -2156,10 +2168,22 @@ class MTAOS(salobj.ConfigurableCsc):
         dof_visit = model.get_dof_lv()
         visit_id, extra_id = model.get_visit_ids()
         kp_gain, ki_gain, kd_gain = model.get_gains()
+        (
+            optical_state,
+            integral_error,
+            integral_error_clipped,
+            derivative_term,
+            derivative_term_filtered,
+        ) = model.get_pid_diagnostics()
         focus_index = 0
         await self.evt_rejectedDegreeOfFreedom.set_write(
             aggregatedDoF=dof_aggr,
             visitDoF=dof_visit,
+            opticalState=optical_state,
+            integralError=integral_error,
+            integralErrorClipped=integral_error_clipped,
+            derivativeTerm=derivative_term,
+            derivativeTermFiltered=derivative_term_filtered,
             visitId=visit_id,
             extraId=extra_id,
             kpGain=kp_gain
